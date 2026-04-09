@@ -22,7 +22,10 @@ from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Windo
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
 
-from .. import config as cfg_mod
+try:
+    from .. import config as cfg_mod
+except ImportError:
+    import config as cfg_mod
 
 # ── Style ─────────────────────────────────────────────────────────────────────
 

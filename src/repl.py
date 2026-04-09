@@ -9,38 +9,126 @@ from pathlib import Path
 from typing import Optional
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
+from prompt_toolkit.buffer import Buffer
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
+import random
 
-from . import bridge, config as cfg_mod
-from .ai.openrouter import OpenRouterClient, OpenRouterError
-from .tui.tree_nav import TreeNavigator
-from .tui.editor import Editor
-from .tui.config_panel import ConfigPanel
+try:
+    from . import bridge, config as cfg_mod
+    from .ai.openrouter import OpenRouterClient, OpenRouterError
+    from .tui.tree_nav import TreeNavigator
+    from .tui.editor import Editor
+    from .tui.config_panel import ConfigPanel
+except ImportError:
+    # Fallback for direct execution
+    import bridge
+    import config as cfg_mod
+    from ai.openrouter import OpenRouterClient, OpenRouterError
+    from tui.tree_nav import TreeNavigator
+    from tui.editor import Editor
+    from tui.config_panel import ConfigPanel
 
 console = Console()
 
 # ── Prompt style ─────────────────────────────────────────────────────────────
 
 PROMPT_STYLE = Style.from_dict({
-    "rb":    "#00afff bold",       # "regbroker"
-    "ctx":   "#3d4752",            # brackets
-    "hive":  "#5fd7ff",            # hive name
-    "sep":   "#3d4752",            # › separator
-    "path":  "#79c0ff",            # registry path
-    "arrow": "#00ff87 bold",       # ❯
+    "line":   "#3d4752",            # horizontal line color
+    "arrow":  "#00afff bold",       # > arrow (blue)
     "completion-menu.completion":         "bg:#1a1a2e #c9d1d9",
     "completion-menu.completion.current": "bg:#0d3b66 #ffffff bold",
     "auto-suggestion":                    "#333344",
 })
+
+# ── Auto Suggest ─────────────────────────────────────────────────────────────
+
+class _RegBrokerAutoSuggest:
+    """Claude Code-style intelligent auto-suggestions."""
+    
+    def __init__(self, state: "State"):
+        self._s = state
+        self._suggestions = [
+            "open <hive_file>",
+            "ls", 
+            "cd <path>",
+            "info",
+            "find <pattern>",
+            "search <text>",
+            "hex <value>",
+            "note",
+            "report",
+            "recover",
+            "models",
+            "config",
+            "help",
+        ]
+        
+    def get_suggestion(self, buffer, document):
+        """Return a suggestion based on current context."""
+        return self._get_suggestion_sync(document)
+        
+    async def get_suggestion_async(self, buffer, document):
+        """Async version of get_suggestion."""
+        return self._get_suggestion_sync(document)
+        
+    def _get_suggestion_sync(self, document):
+        """Sync implementation for suggestion logic."""
+        text = document.text_before_cursor.strip()
+        
+        if not text:
+            # No input yet, suggest a random useful command
+            if self._s.hive_open:
+                suggestions = ["ls", "info", "cd", "find", "search", "note", "report"]
+            else:
+                suggestions = ["open <hive_file>", "help", "config"]
+            return Suggestion(random.choice(suggestions))
+            
+        # Get first word to determine command
+        words = text.split()
+        if not words:
+            return None
+            
+        cmd = words[0].lower()
+        
+        # Suggest based on partial command
+        if len(cmd) < 3:
+            matches = [s for s in self._suggestions if s.startswith(cmd)]
+            if matches:
+                return Suggestion(matches[0])
+                
+        # Context-aware suggestions
+        if cmd in ("cd", "ls") and self._s.hive_open:
+            if len(words) == 1:
+                return Suggestion(f"{cmd} \\Software\\")
+            elif len(words) == 2 and not text.endswith(" "):
+                # Suggest common paths
+                return Suggestion(f"{text}\\")
+                
+        elif cmd == "open" and len(words) == 1:
+            return Suggestion("open C:\\Windows\\System32\\config\\SOFTWARE")
+            
+        elif cmd == "find" and len(words) == 1:
+            return Suggestion("find Software")
+            
+        elif cmd == "search" and len(words) == 1:
+            return Suggestion("search ")
+            
+        elif cmd == "hex" and len(words) == 1:
+            return Suggestion("hex ")
+            
+        return None
 
 # ── Completer ─────────────────────────────────────────────────────────────────
 
@@ -135,20 +223,8 @@ class State:
         self.report_path: Path = Path("laudo_pericial.md")
 
     def make_prompt(self) -> HTML:
-        if self.hive_open:
-            # Shorten path for display
-            parts  = [p for p in self.path.split("\\") if p]
-            disp   = " › ".join(parts[-2:]) if len(parts) > 2 else self.path
-            return HTML(
-                f'<rb>regbroker</rb>'
-                f'<ctx> [</ctx>'
-                f'<hive>{_he(self.hive_name)}</hive>'
-                f'<sep> › </sep>'
-                f'<path>{_he(disp)}</path>'
-                f'<ctx>]</ctx>'
-                f'<arrow> ❯ </arrow>'
-            )
-        return HTML('<rb>regbroker</rb><arrow> ❯ </arrow>')
+        # Simplified prompt: just > for input
+        return HTML('<arrow>></arrow>')
 
 
 def _he(s: str) -> str:
@@ -171,10 +247,12 @@ class Repl:
 
         self._session: PromptSession = PromptSession(
             history=FileHistory(str(hist_dir / "history")),
-            auto_suggest=AutoSuggestFromHistory(),
+            auto_suggest=_RegBrokerAutoSuggest(self.st),
             completer=_Completer(self.st),
             style=PROMPT_STYLE,
             complete_while_typing=True,
+            multiline=False,
+            wrap_lines=False,
         )
         self._editor        = Editor()
         self._config_panel  = ConfigPanel()
@@ -194,18 +272,49 @@ class Repl:
         _print_banner()
         if initial_hive:
             self._open([initial_hive])
+        
+        ctrl_c_count = 0
+        
         while True:
             try:
+                # Create custom layout with horizontal lines
+                terminal_width = shutil.get_terminal_size((80, 24)).columns
+                top_line = "─" * terminal_width
+                bottom_line = "─" * terminal_width
+                
+                # Print top line
+                console.print(top_line, style="dim")
+                
+                # Get input with > prompt
                 line = self._session.prompt(self.st.make_prompt()).strip()
+                
+                # Print bottom line
+                console.print(bottom_line, style="dim")
+                
+                if not line:
+                    continue
+                    
+                self._dispatch(line)
+                
+                # Reset Ctrl+C counter on successful command
+                ctrl_c_count = 0
+                
             except KeyboardInterrupt:
-                console.print()
-                continue
+                ctrl_c_count += 1
+                if ctrl_c_count == 1:
+                    console.print("\n[dim]Press Ctrl+C again to exit[/dim]")
+                    continue
+                else:
+                    console.print("\n[dim]Exiting...[/dim]")
+                    break
             except EOFError:
                 console.print("[dim]bye.[/dim]")
                 break
-            if not line:
-                continue
-            self._dispatch(line)
+
+    def _print_horizontal_line(self) -> None:
+        """Print horizontal line like Claude Code interface."""
+        terminal_width = shutil.get_terminal_size((80, 24)).columns
+        console.print("─" * terminal_width, style="dim")
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
 

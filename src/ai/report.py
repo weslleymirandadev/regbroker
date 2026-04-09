@@ -6,7 +6,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .openrouter import OpenRouterClient
+try:
+    from .openrouter import OpenRouterClient
+except ImportError:
+    from openrouter import OpenRouterClient
 
 SYSTEM_PROMPT = textwrap.dedent("""\
     Você é um perito forense digital especializado em análise de registros do Windows.

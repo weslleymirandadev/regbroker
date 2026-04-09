@@ -19,7 +19,10 @@ from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 
-from .. import bridge
+try:
+    from .. import bridge
+except ImportError:
+    import bridge
 
 # ── Style ─────────────────────────────────────────────────────────────────────
 

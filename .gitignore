@@ -1,11 +1,27 @@
 .openclaude-profile.json
+regbroker
+regbroker.exe
 
-# arquivos gerados pelo CMake
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-CMakeFiles
+# ambiente virtual
+.venv/
+venv/
 
 # arquivos gerados pelo python
 __pycache__
 *.egg-info
+
+# arquivos temporários e logs
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# IDE e editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# sistema operacional
+.DS_Store
+Thumbs.db

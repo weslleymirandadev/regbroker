@@ -1,0 +1,7 @@
+.openclaude-profile.json
+
+# arquivos gerados pelo CMake
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CMakeFiles

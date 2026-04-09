@@ -1,71 +1,84 @@
 #!/bin/bash
 # Note: On Linux/Unix systems, make this script executable with: chmod +x build.sh
+set -e
 
 echo "=== RegBroker Build ==="
 echo
 
-# ── 1. Build C++ core ────────────────────────────────────────────────────────
-echo "[1/3] Building C++ core (regbroker-core)..."
-cd core
-
-if [ ! -d build ]; then
-    mkdir build
-fi
-
-cmake -B build -DCMAKE_BUILD_TYPE=Release 2>/dev/null
-if [ $? -ne 0 ]; then
-    echo "ERROR: CMake configuration failed."
-    echo "Make sure CMake and a C++20 compiler are installed."
-    exit 1
-fi
-
-cmake --build build --config Release
-if [ $? -ne 0 ]; then
-    echo "ERROR: C++ build failed."
-    exit 1
-fi
-
-cd ..
-
-# ── 2. Copy binary to bin/ ───────────────────────────────────────────────────
-echo
-echo "[2/3] Installing core binary..."
-if [ ! -d bin ]; then
-    mkdir bin
-fi
-
-CORE_BIN="core/build/regbroker-core"
-if [ ! -f "$CORE_BIN" ]; then
-    CORE_BIN="core/build/Release/regbroker-core"
-fi
-
-if [ -f "$CORE_BIN" ]; then
-    cp -f "$CORE_BIN" bin/regbroker-core
-    echo "  Copied to bin/regbroker-core"
+# ── 1. Create virtual environment ────────────────────────────────────────
+if [ ! -d ".venv" ]; then
+    echo "[1/5] Creating virtual environment..."
+    python3 -m venv .venv
 else
-    echo "WARNING: Could not find built binary. Check core/build/"
+    echo "[1/5] Virtual environment already exists."
 fi
+
+# ── 2. Activate virtual environment ───────────────────────────────────────
+echo
+echo "[2/5] Activating virtual environment..."
+source .venv/bin/activate
 
 # ── 3. Install Python package ────────────────────────────────────────────────
 echo
-echo "[3/3] Installing Python package..."
-pip install -e . --quiet
+echo "[3/5] Installing Python package..."
+pip install -e .
 if [ $? -ne 0 ]; then
     echo "ERROR: pip install failed."
     exit 1
 fi
 
+# ── 4. Install PyInstaller ───────────────────────────────────────────────────
+echo
+echo "[4/5] Installing PyInstaller..."
+pip install pyinstaller
+if [ $? -ne 0 ]; then
+    echo "ERROR: PyInstaller install failed."
+    exit 1
+fi
+
+# ── 5. Build executable ─────────────────────────────────────────────────────
+echo
+echo "[5/5] Building executable..."
+if [ ! -d build ]; then
+    mkdir build
+fi
+
+# Get version from pyproject.toml
+VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
+OS_NAME="linux"
+EXECUTABLE_NAME="regbroker-${VERSION}-${OS_NAME}"
+
+# Export variables for spec file
+export REGBROKER_VERSION="$VERSION"
+export REGBROKER_OS="$OS_NAME"
+
+# Build with version and OS in name
+pyinstaller --distpath build regbroker.spec
+if [ $? -ne 0 ]; then
+    echo "ERROR: PyInstaller build failed."
+    exit 1
+fi
+
+# Clean up PyInstaller artifacts
+rm -rf dist __pycache__
+
 echo
 echo "=== Build complete! ==="
 echo
+echo "Executable created: build/${EXECUTABLE_NAME}"
+echo
 echo "Usage:"
-echo "  regbroker                          -- interactive REPL"
-echo "  regbroker NTUSER.DAT               -- open hive directly"
-echo "  regbroker -k YOUR_API_KEY          -- start with API key"
-echo "  regbroker NTUSER.DAT -k YOUR_KEY   -- both"
+echo "  ./${EXECUTABLE_NAME}                          -- interactive REPL with AI-powered analysis"
+echo "  ./${EXECUTABLE_NAME} NTUSER.DAT              -- open hive file directly"
+echo "  ./${EXECUTABLE_NAME} --version                 -- show version"
 echo
 echo "First run setup:"
-echo "  regbroker"
+echo "  ./${EXECUTABLE_NAME}"
 echo "  > config set api_key YOUR_OPENROUTER_KEY"
 echo "  > config set model   anthropic/claude-3.5-haiku"
 echo "  > open /path/to/NTUSER.DAT"
+echo
+echo "AI-powered registry forensics tool."
+echo
+echo "Virtual environment created at: .venv/"
+echo "To activate manually: source .venv/bin/activate"

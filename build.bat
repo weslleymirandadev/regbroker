@@ -4,66 +4,83 @@ setlocal
 echo === RegBroker Build ===
 echo.
 
-REM ── 1. Build C++ core ────────────────────────────────────────────────────────
-echo [1/3] Building C++ core (regbroker-core)...
-cd core
-
-if not exist build mkdir build
-cmake -B build -DCMAKE_BUILD_TYPE=Release -G "Visual Studio 17 2022" -A x64 2>nul
-if errorlevel 1 (
-    cmake -B build -DCMAKE_BUILD_TYPE=Release 2>nul
-)
-if errorlevel 1 (
-    echo ERROR: CMake configuration failed.
-    echo Make sure CMake and a C++20 compiler are installed.
-    exit /b 1
-)
-
-cmake --build build --config Release
-if errorlevel 1 (
-    echo ERROR: C++ build failed.
-    exit /b 1
-)
-
-cd ..
-
-REM ── 2. Copy binary to bin/ ───────────────────────────────────────────────────
-echo.
-echo [2/3] Installing core binary...
-if not exist bin mkdir bin
-
-set CORE_BIN=core\build\Release\regbroker-core.exe
-if not exist %CORE_BIN% set CORE_BIN=core\build\regbroker-core.exe
-if not exist %CORE_BIN% set CORE_BIN=core\build\Release\regbroker-core
-
-if exist %CORE_BIN% (
-    copy /Y %CORE_BIN% bin\regbroker-core.exe >nul
-    echo   Copied to bin\regbroker-core.exe
+REM ── 1. Create virtual environment ────────────────────────────────────────
+if not exist .venv (
+    echo [1/5] Creating virtual environment...
+    python -m venv .venv
 ) else (
-    echo WARNING: Could not find built binary. Check core\build\
+    echo [1/5] Virtual environment already exists.
 )
+
+REM ── 2. Activate virtual environment ───────────────────────────────────────
+echo.
+echo [2/5] Activating virtual environment...
+call .venv\Scripts\activate.bat
+
+REM Upgrade pip in virtual environment
+python -m pip install --upgrade pip --quiet
 
 REM ── 3. Install Python package ────────────────────────────────────────────────
 echo.
-echo [3/3] Installing Python package...
+echo [3/5] Installing Python package...
 pip install -e . --quiet
 if errorlevel 1 (
     echo ERROR: pip install failed.
     exit /b 1
 )
 
+REM ── 4. Install PyInstaller ───────────────────────────────────────────────────
+echo.
+echo [4/5] Installing PyInstaller...
+pip install pyinstaller --quiet
+if errorlevel 1 (
+    echo ERROR: PyInstaller install failed.
+    exit /b 1
+)
+
+REM ── 5. Build executable ─────────────────────────────────────────────────────
+echo.
+echo [5/5] Building executable...
+if not exist build mkdir build
+
+REM Get version from pyproject.toml
+for /f "tokens=2 delims=" %%i in ('findstr "version = " pyproject.toml') do set VERSION=%%i
+set OS_NAME=windows
+set EXECUTABLE_NAME=regbroker-%VERSION%-%OS_NAME%
+
+REM Set environment variables for spec file
+set REGBROKER_VERSION=%VERSION%
+set REGBROKER_OS=%OS_NAME%
+
+REM Build with version and OS in name
+pyinstaller --distpath build regbroker.spec
+if errorlevel 1 (
+    echo ERROR: PyInstaller build failed.
+    exit /b 1
+)
+
+REM Clean up PyInstaller artifacts
+if exist dist rmdir /s /q dist
+if exist build rmdir /s /q __pycache__
+
 echo.
 echo === Build complete! ===
 echo.
+echo Executable created: build\%EXECUTABLE_NAME%.exe
+echo.
 echo Usage:
-echo   regbroker                          -- interactive REPL
-echo   regbroker NTUSER.DAT               -- open hive directly
-echo   regbroker -k YOUR_API_KEY          -- start with API key
-echo   regbroker NTUSER.DAT -k YOUR_KEY   -- both
+echo   %EXECUTABLE_NAME%.exe                          -- interactive REPL with AI-powered analysis
+echo   %EXECUTABLE_NAME%.exe NTUSER.DAT              -- open hive file directly
+echo   %EXECUTABLE_NAME%.exe --version                 -- show version
 echo.
 echo First run setup:
-echo   regbroker
+echo   %EXECUTABLE_NAME%.exe
 echo   ^> config set api_key YOUR_OPENROUTER_KEY
 echo   ^> config set model   anthropic/claude-3.5-haiku
-echo   ^> open C:\path\to\NTUSER.DAT
+echo   ^> open /path/to/NTUSER.DAT
+echo.
+echo AI-powered registry forensics tool.
+echo.
+echo Virtual environment created at: .venv\
+echo To activate manually: .venv\Scripts\activate.bat
 endlocal

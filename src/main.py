@@ -18,11 +18,12 @@ if __name__ == "__main__":
 # Import modules
 try:
     import config as cfg_mod
-    import repl
-    Repl = repl.Repl
+    import minimal_repl
+    run_repl = minimal_repl.run_minimal_repl
 except ImportError as e:
     print(f"Import error: {e}")
     print("Could not import required modules.")
+    print("Make sure to install dependencies: pip install -r requirements.txt")
     print("Current sys.path:")
     for p in sys.path:
         print(f"  {p}")
@@ -39,7 +40,7 @@ def main() -> None:
     args = p.parse_args()
 
     config = cfg_mod.load()
-    Repl(config).run(initial_hive=args.hivefile or "")
+    run_repl(config, initial_hive=args.hivefile or "")
 
 
 if __name__ == "__main__":

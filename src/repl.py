@@ -1,23 +1,20 @@
-"""RegBroker interactive REPL — Claude Code-style interface."""
+"""RegBroker interactive REPL — Claude Code-style interface with Textual."""
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory, Suggestion
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.styles import Style
-from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window
-from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
-from prompt_toolkit.buffer import Buffer
+from textual.app import App, ComposeResult
+from textual.containers import Container, Vertical
+from textual.reactive import reactive
+from textual.widgets import Footer, Header, Input, Static
+from textual.binding import Binding
+from rich.text import Text
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -42,15 +39,86 @@ except ImportError:
 
 console = Console()
 
-# ── Prompt style ─────────────────────────────────────────────────────────────
+# ── Textual Widgets ───────────────────────────────────────────────────────────
 
-PROMPT_STYLE = Style.from_dict({
-    "line":   "#3d4752",            # horizontal line color
-    "arrow":  "#00afff bold",       # > arrow (blue)
-    "completion-menu.completion":         "bg:#1a1a2e #c9d1d9",
-    "completion-menu.completion.current": "bg:#0d3b66 #ffffff bold",
-    "auto-suggestion":                    "#333344",
-})
+class ClaudeCodeInput(Input):
+    """Custom input widget with Claude Code styling."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(placeholder="", **kwargs)
+        self.cursor_blink = True
+        
+    def render_prefix(self) -> Text:
+        """Render the > prefix."""
+        prefix = Text("> ")
+        prefix.stylize("bold blue")
+        return prefix
+
+
+class ClaudeCodeLine(Static):
+    """Horizontal line widget."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(" " * 80, **kwargs)
+        
+    def render(self) -> Text:
+        """Render horizontal line."""
+        terminal_width = self.size.width if self.size else 80
+        line = " " * terminal_width
+        text = Text(line)
+        text.stylize("dim")
+        return text
+
+
+class OutputArea(Static):
+    """Output display area."""
+    
+    def __init__(self, **kwargs):
+        super().__init__("", **kwargs)
+        self.can_focus = False
+        self._output_lines = []
+        
+    def add_output(self, text: str, style: str = "") -> None:
+        """Add text to output area."""
+        self._output_lines.append((text, style))
+        self._update_display()
+        
+    def _update_display(self) -> None:
+        """Update the display with all output lines."""
+        if not self._output_lines:
+            self.update("")
+            return
+            
+        # Show last 20 lines to avoid overflow
+        recent_lines = self._output_lines[-20:]
+        formatted_lines = []
+        
+        for text, style in recent_lines:
+            if style:
+                formatted = Text(text)
+                formatted.stylize(style)
+                formatted_lines.append(str(formatted))
+            else:
+                formatted_lines.append(text)
+                
+        self.update("\n".join(formatted_lines))
+
+
+# ── State Management ───────────────────────────────────────────────────────────
+
+class State:
+    """Global REPL state."""
+    def __init__(self):
+        self.hive_name: str = ""
+        self.hive_path: str = ""
+        self.hive_info: dict = {}
+        self.path:      str  = "\\"
+        self.hive_open: bool = False
+        self.config:    dict = {}
+        self.ai:        Optional[OpenRouterClient] = None
+        self.model_cache: list = []
+        self.report_md: str  = ""      # last generated report
+        self.report_path: Path = Path("laudo_pericial.md")
 
 # ── Auto Suggest ─────────────────────────────────────────────────────────────
 
@@ -71,6 +139,7 @@ class _RegBrokerAutoSuggest:
             "report",
             "recover",
             "models",
+            "model",
             "config",
             "help",
         ]
@@ -130,469 +199,405 @@ class _RegBrokerAutoSuggest:
             
         return None
 
-# ── Completer ─────────────────────────────────────────────────────────────────
+# ── Textual REPL App ──────────────────────────────────────────────────────────
 
-class _Completer(Completer):
-    COMMANDS = [
-        "open", "ls", "cd", "info", "hex", "find", "search",
-        "note", "report", "recover", "models", "model",
-        "config", "help", "exit",
+class Repl(App):
+    """Textual-based REPL with Claude Code interface."""
+    
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    
+    .main-container {
+        height: 100%;
+        padding: 0;
+    }
+    
+    .output-area {
+        height: 1fr;
+        padding: 0 1;
+        background: $background;
+        border: none;
+    }
+    
+    .input-container {
+        height: 3;
+        padding: 0 1;
+        background: $background;
+        border: none;
+    }
+    
+    .line {
+        height: 1;
+        padding: 0 1;
+        background: $background;
+        border: none;
+        content-align: center middle;
+    }
+    
+    ClaudeCodeInput {
+        width: 100%;
+        border: none;
+        background: $background;
+    }
+    
+    ClaudeCodeInput.-focus {
+        border: none;
+        background: $background;
+    }
+    """
+    
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("enter", "submit_command", "Submit"),
+        Binding("tab", "autocomplete", "Complete"),
     ]
-
-    def __init__(self, state: "State"):
-        self._s = state
-
-    def get_completions(self, document, complete_event):
-        text  = document.text_before_cursor
-        words = text.split()
-        space = text.endswith(" ")
-
-        # Complete command name
-        if not words or (len(words) == 1 and not space):
-            partial = words[0] if words else ""
-            for c in self.COMMANDS:
-                if c.startswith(partial):
-                    yield Completion(c, -len(partial))
-            return
-
-        cmd = words[0].lower()
-
-        # Complete registry path after cd / ls / find / search
-        if cmd in ("cd", "ls", "find", "search") and self._s.hive_open:
-            partial = words[-1] if len(words) > 1 else ""
-            yield from self._complete_path(partial)
-
-        # Complete value name after info hex note
-        elif cmd in ("hex",) and self._s.hive_open:
-            partial = words[-1] if len(words) > 1 else ""
-            try:
-                data = bridge.ls(self._s.hive_path, self._s.path)
-                for v in data.get("values", []):
-                    name = v.get("name", "") or "(Default)"
-                    if name.lower().startswith(partial.lower()):
-                        yield Completion(name, -len(partial))
-            except Exception:
-                pass
-
-        elif cmd == "report" and len(words) == 2 and not space:
-            for sub in ("edit", "save"):
-                if sub.startswith(words[1]):
-                    yield Completion(sub, -len(words[1]))
-
-        elif cmd == "model" and self._s.model_cache:
-            partial = words[-1] if len(words) > 1 else ""
-            for m in self._s.model_cache:
-                mid = m.get("id", "")
-                if mid.lower().startswith(partial.lower()):
-                    yield Completion(mid, -len(partial))
-
-    def _complete_path(self, partial: str):
-        try:
-            if "\\" in partial:
-                sep  = partial.rfind("\\")
-                base = partial[:sep] or "\\"
-                pfx  = partial[sep + 1:]
-            else:
-                base = self._s.path
-                pfx  = partial
-            data = bridge.ls(self._s.hive_path, base)
-            for sk in data.get("subkeys", []):
-                name = sk.get("name", "")
-                if name.lower().startswith(pfx.lower()):
-                    full = base.rstrip("\\") + "\\" + name
-                    yield Completion(full, -len(partial),
-                                     display=f"[{name}]",
-                                     display_meta=f"{sk.get('num_subkeys',0)}▸")
-        except Exception:
-            pass
-
-
-# ── State ─────────────────────────────────────────────────────────────────────
-
-class State:
-    def __init__(self):
-        self.hive_path: str  = ""
-        self.hive_name: str  = ""
-        self.hive_info: dict = {}
-        self.path:      str  = "\\"
-        self.hive_open: bool = False
-        self.config:    dict = {}
-        self.ai:        Optional[OpenRouterClient] = None
-        self.model_cache: list = []
-        self.report_md: str  = ""      # last generated report
-        self.report_path: Path = Path("laudo_pericial.md")
-
-    def make_prompt(self) -> HTML:
-        # Simplified prompt: just > for input
-        return HTML('<arrow>></arrow>')
-
-
-def _he(s: str) -> str:
-    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-
-# ── REPL ──────────────────────────────────────────────────────────────────────
-
-class Repl:
-    def __init__(self, config: dict):
-        global _cfg
+    
+    def __init__(self, config: dict, **kwargs):
+        super().__init__(**kwargs)
+        self.config = config
         self.st = State()
         self.st.config = config
-        _cfg = config   # make timestamp formatter config-aware
-
+        self.ctrl_c_count = 0
+        
+        # Apply AI config
         self._apply_ai_config()
+        
+        # Initialize other components
+        self._editor = Editor()
+        self._config_panel = ConfigPanel()
+        
+    def compose(self) -> ComposeResult:
+        """Compose the UI."""
+        yield Header(show_clock=False)
+        
+        with Container(classes="main-container"):
+            yield OutputArea(classes="output-area", id="output")
+            yield ClaudeCodeLine(classes="line")
+            with Container(classes="input-container"):
+                yield ClaudeCodeInput(id="input")
+            yield ClaudeCodeLine(classes="line")
+            
+        yield Footer()
+        
+    def on_mount(self) -> None:
+        """Called when app is mounted."""
+        self.title = "regbroker - Windows Registry Hive Forensics"
+        self.sub_title = "AI-powered Analysis"
+        
+        # Focus on input
+        input_widget = self.query_one("#input", ClaudeCodeInput)
+        input_widget.focus()
+        
+        # Show welcome message
+        self._show_banner()
+        
+    def _show_banner(self) -> None:
+        """Show welcome banner."""
+        output = self.query_one("#output", OutputArea)
+        banner = """
+[bold blue]regbroker[/bold blue] - Windows Registry Hive Forensics
+[dim]AI-powered Registry Analysis Tool[/dim]
 
-        hist_dir = Path.home() / ".regbroker"
-        hist_dir.mkdir(exist_ok=True)
-
-        self._session: PromptSession = PromptSession(
-            history=FileHistory(str(hist_dir / "history")),
-            auto_suggest=_RegBrokerAutoSuggest(self.st),
-            completer=_Completer(self.st),
-            style=PROMPT_STYLE,
-            complete_while_typing=True,
-            multiline=False,
-            wrap_lines=False,
-        )
-        self._editor        = Editor()
-        self._config_panel  = ConfigPanel()
-
+Type [cyan]help[/cyan] for commands or [cyan]open <hive_file>[/cyan] to start.
+        """.strip()
+        output.add_output(banner)
+        
     def _apply_ai_config(self) -> None:
-        """Instantiate / update the AI client from current config."""
+        """Apply AI configuration."""
         api_key = self.st.config.get("api_key", "")
-        model   = self.st.config.get("model", "anthropic/claude-3.5-haiku")
+        model = self.st.config.get("model", "anthropic/claude-3.5-haiku")
         if api_key:
             if self.st.ai:
                 self.st.ai.set_model(model)
                 self.st.ai.api_key = api_key
             else:
                 self.st.ai = OpenRouterClient(api_key, model)
-
-    def run(self, initial_hive: str = "") -> None:
-        _print_banner()
-        if initial_hive:
-            self._open([initial_hive])
+            
+    def action_submit_command(self) -> None:
+        """Handle command submission."""
+        input_widget = self.query_one("#input", ClaudeCodeInput)
+        command = input_widget.value.strip()
         
-        ctrl_c_count = 0
-        
-        while True:
-            try:
-                # Create custom layout with horizontal lines
-                terminal_width = shutil.get_terminal_size((80, 24)).columns
-                top_line = "─" * terminal_width
-                bottom_line = "─" * terminal_width
-                
-                # Print top line
-                console.print(top_line, style="dim")
-                
-                # Get input with > prompt
-                line = self._session.prompt(self.st.make_prompt()).strip()
-                
-                # Print bottom line
-                console.print(bottom_line, style="dim")
-                
-                if not line:
-                    continue
-                    
-                self._dispatch(line)
-                
-                # Reset Ctrl+C counter on successful command
-                ctrl_c_count = 0
-                
-            except KeyboardInterrupt:
-                ctrl_c_count += 1
-                if ctrl_c_count == 1:
-                    console.print("\n[dim]Press Ctrl+C again to exit[/dim]")
-                    continue
-                else:
-                    console.print("\n[dim]Exiting...[/dim]")
-                    break
-            except EOFError:
-                console.print("[dim]bye.[/dim]")
-                break
-
-    def _print_horizontal_line(self) -> None:
-        """Print horizontal line like Claude Code interface."""
-        terminal_width = shutil.get_terminal_size((80, 24)).columns
-        console.print("─" * terminal_width, style="dim")
-
-    # ── Dispatch ──────────────────────────────────────────────────────────────
-
-    def _dispatch(self, line: str) -> None:
-        tokens = _tok(line)
-        if not tokens:
+        if not command:
             return
-        cmd, *args = tokens
+            
+        # Show command in output
+        output = self.query_one("#output", OutputArea)
+        output.add_output(f"> {command}", "cyan")
+        
+        # Clear input
+        input_widget.value = ""
+        
+        # Reset Ctrl+C counter
+        self.ctrl_c_count = 0
+        
+        # Process command
+        asyncio.create_task(self._process_command(command))
+        
+    async def _process_command(self, command: str) -> None:
+        """Process a command asynchronously."""
+        output = self.query_one("#output", OutputArea)
+        
+        try:
+            # Tokenize command
+            tokens = _tok(command)
+            if not tokens:
+                return
+                
+            cmd, *args = tokens
+            
+            # Dispatch command
+            await self._dispatch(cmd.lower(), args)
+                
+        except Exception as e:
+            output.add_output(f"Error: {e}", "red")
+            
+    async def _dispatch(self, cmd: str, args: list[str]) -> None:
+        """Dispatch command with all original functionality."""
+        output = self.query_one("#output", OutputArea)
+        
         try:
             {
-                "open":    self._open,
-                "ls":      self._ls,
-                "dir":     self._ls,
-                "cd":      self._cd,
-                "info":    self._info,
-                "hex":     self._hex,
-                "find":    self._find,
-                "search":  self._search,
-                "note":    self._note,
-                "report":  self._report,
-                "recover": self._recover,
-                "models":  self._models,
-                "model":   self._model,
-                "config":  self._config,
-                "help":    self._help,
-                "exit":    lambda _: sys.exit(0),
-                "quit":    lambda _: sys.exit(0),
-            }.get(cmd.lower(), self._unknown)(args)
-        except bridge.BridgeError as e:
-            console.print(f"[bold red]core error:[/bold red] {e}")
-        except OpenRouterError as e:
-            console.print(f"[bold red]AI error:[/bold red] {e}")
-        except KeyboardInterrupt:
-            console.print("\n[dim]interrupted.[/dim]")
+                "open":    lambda: self._open(args),
+                "ls":      lambda: self._ls(args),
+                "dir":     lambda: self._ls(args),
+                "cd":      lambda: self._cd(args),
+                "info":    lambda: self._info(args),
+                "hex":     lambda: self._hex(args),
+                "find":    lambda: self._find(args),
+                "search":  lambda: self._search(args),
+                "note":    lambda: self._note(args),
+                "report":  lambda: self._report(args),
+                "recover": lambda: self._recover(args),
+                "models":  lambda: self._models(args),
+                "model":   lambda: self._model(args),
+                "config":  lambda: self._config(args),
+                "help":    lambda: self._help(args),
+                "exit":    lambda: self._exit(args),
+                "quit":    lambda: self._exit(args),
+            }[cmd]()
+        except KeyError:
+            output.add_output(f"Unknown command: {cmd}", "red")
         except Exception as e:
-            console.print(f"[bold red]error:[/bold red] {e}")
+            output.add_output(f"Error: {e}", "red")
+            
+    def action_autocomplete(self) -> None:
+        """Handle autocomplete."""
+        input_widget = self.query_one("#input", ClaudeCodeInput)
+        current_text = input_widget.value
+        
+        # Simple autocomplete suggestions
+        suggestions = ["help", "open", "ls", "cd", "info", "find", "search", "hex", "note", "report", "config", "exit"]
+        
+        for suggestion in suggestions:
+            if suggestion.startswith(current_text):
+                input_widget.value = suggestion
+                break
+                
+    def action_quit(self) -> None:
+        """Handle quit action."""
+        if self.ctrl_c_count == 0:
+            self.ctrl_c_count = 1
+            output = self.query_one("#output", OutputArea)
+            output.add_output("Press Ctrl+C again to exit", "yellow")
+        else:
+            self.exit()
 
-    def _unknown(self, _):
-        console.print("[dim]Unknown command. Type [bold]help[/bold] for a list.[/dim]")
-
-    # ── Commands ──────────────────────────────────────────────────────────────
+    # ── Commands (same as original but with Textual output) ───────────────────────────
 
     def _open(self, args: list[str]) -> None:
+        output = self.query_one("#output", OutputArea)
         if not args:
-            console.print("[dim]Usage:[/dim] open [bold]<hivefile>[/bold]")
+            output.add_output("Usage: open <hive_file>", "red")
             return
-        path = " ".join(args)
-        if not os.path.exists(path):
-            console.print(f"[red]File not found:[/red] {path}")
+        hive_path = Path(args[0]).expanduser().resolve()
+        if not hive_path.is_file():
+            output.add_output(f"File not found: {hive_path}", "red")
             return
-        console.print(f"[dim]Loading[/dim] {path} …")
-        info = bridge.hive_info(path)
-        self.st.hive_path = path
-        self.st.hive_name = Path(path).name
-        self.st.hive_info = info
-        self.st.path      = "\\"
-        self.st.hive_open = True
-        _print_hive_info(info, path)
+        try:
+            self.st.hive_path = str(hive_path)
+            self.st.hive_name = hive_path.name
+            self.st.hive_info = bridge.info(self.st.hive_path)
+            self.st.hive_open = True
+            self.st.path = "\\"
+            output.add_output(f"Opened: {self.st.hive_name}", "green")
+            output.add_output(f"Type: {self.st.hive_info.get('type', 'unknown')}")
+            output.add_output(f"Modified: {self.st.hive_info.get('last_modified', 'unknown')}")
+        except Exception as e:
+            output.add_output(f"Failed to open hive: {e}", "red")
 
     def _ls(self, args: list[str]) -> None:
-        if not self._need_hive(): return
-        path = self._resolve(args[0]) if args else self.st.path
-        data = bridge.ls(self.st.hive_path, path)
-        _print_ls(data)
+        output = self.query_one("#output", OutputArea)
+        if not self.st.hive_open:
+            output.add_output("No hive is open. Use 'open <hive_file>' first.", "red")
+            return
+        try:
+            data = bridge.ls(self.st.hive_path, self.st.path)
+            # Keys
+            if data.get("keys"):
+                output.add_output("Keys:")
+                for k in data["keys"]:
+                    ts = k.get("last_modified", "")
+                    ts_str = _ts(ts) if ts else ""
+                    output.add_output(f"  {k.get('name', '')} {ts_str}", "cyan")
+            # Values
+            if data.get("values"):
+                output.add_output("Values:")
+                for v in data["values"]:
+                    output.add_output(f"  {v.get('name', '(Default)')} {_val_type(v.get('type', ''))}", "green")
+        except Exception as e:
+            output.add_output(f"Failed to list: {e}", "red")
 
     def _cd(self, args: list[str]) -> None:
-        if not self._need_hive(): return
-
-        if args:
-            # Direct navigation: cd <path>
-            target = args[0]
-            if target in ("..", "..\\"):
-                parts = self.st.path.rstrip("\\").rsplit("\\", 1)
-                self.st.path = parts[0] if parts[0] else "\\"
-                return
-            if target in ("\\", "/"):
+        output = self.query_one("#output", OutputArea)
+        if not self.st.hive_open:
+            output.add_output("No hive is open. Use 'open <hive_file>' first.", "red")
+            return
+        if not args:
+            output.add_output("Usage: cd <path>", "red")
+            return
+        target = args[0]
+        if target == "..":
+            parts = [p for p in self.st.path.split("\\") if p]
+            if len(parts) > 1:
+                parts.pop()
+                self.st.path = "\\" + "\\".join(parts)
+            else:
                 self.st.path = "\\"
-                return
-            new_path = self._resolve(target)
-            # Validate
-            bridge.ls(self.st.hive_path, new_path)  # raises on error
-            self.st.path = new_path
+        elif target.startswith("\\"):
+            self.st.path = target
         else:
-            # Interactive tree navigator
-            nav = TreeNavigator(self.st.hive_path, self.st.path)
-            result = nav.run()
-            if result:
-                self.st.path = result
-                console.print(f"[dim]→[/dim] [bold cyan]{self.st.path}[/bold cyan]")
+            self.st.path = self.st.path.rstrip("\\") + "\\" + target
+        try:
+            bridge.ls(self.st.hive_path, self.st.path)  # validate
+            output.add_output(f"Changed to: {self.st.path}", "green")
+        except Exception:
+            output.add_output(f"Path not found: {self.st.path}", "red")
+            # rollback
+            parts = [p for p in self.st.path.split("\\") if p]
+            if len(parts) > 1:
+                parts.pop()
+                self.st.path = "\\" + "\\".join(parts)
+            else:
+                self.st.path = "\\"
 
     def _info(self, args: list[str]) -> None:
-        if not self._need_hive(): return
-        path = self._resolve(args[0]) if args else self.st.path
-        data = bridge.ls(self.st.hive_path, path)
-        _print_info(data)
+        output = self.query_one("#output", OutputArea)
+        if not self.st.hive_open:
+            output.add_output("No hive is open. Use 'open <hive_file>' first.", "red")
+            return
+        try:
+            data = bridge.ls(self.st.hive_path, self.st.path)
+            output.add_output(f"Path: {self.st.path}")
+            output.add_output(f"Keys: {len(data.get('keys', []))}")
+            output.add_output(f"Values: {len(data.get('values', []))}")
+            if self.st.path == "\\":
+                output.add_output(f"Hive name: {self.st.hive_name}")
+                output.add_output(f"Hive type: {self.st.hive_info.get('type', 'unknown')}")
+                output.add_output(f"Last modified: {self.st.hive_info.get('last_modified', 'unknown')}")
+        except Exception as e:
+            output.add_output(f"Failed to get info: {e}", "red")
 
     def _hex(self, args: list[str]) -> None:
-        if not self._need_hive(): return
-        if not args:
-            console.print("[dim]Usage:[/dim] hex [bold]<value_name>[/bold]")
+        output = self.query_one("#output", OutputArea)
+        if not self.st.hive_open:
+            output.add_output("No hive is open. Use 'open <hive_file>' first.", "red")
             return
-        name = " ".join(args)
-        data = bridge.cat(self.st.hive_path, self.st.path, name)
-        v    = data.get("value", {})
-        dump = data.get("hex_dump", "")
-        console.print(f"\n[bold cyan]{v.get('name','?')}[/bold cyan]  "
-                      f"[dim]{v.get('type','?')}  {v.get('size',0):,} bytes[/dim]")
-        console.print(Panel(f"[dim]{dump}[/dim]", border_style="dim"))
+        if not args:
+            output.add_output("Usage: hex <value_name>", "red")
+            return
+        try:
+            val = bridge.get(self.st.hive_path, self.st.path, args[0])
+            output.add_output(f"Value: {args[0]}")
+            output.add_output(f"Type: {val.get('type', 'unknown')}")
+            output.add_output("Data:")
+            data = val.get('data', b'')
+            if isinstance(data, str):
+                data = data.encode('utf-8', errors='replace')
+            hex_str = data.hex()
+            # format in blocks of 16 bytes
+            for i in range(0, len(hex_str), 32):
+                block = hex_str[i:i+32]
+                ascii_block = data[i:i+16].decode('ascii', errors='replace')
+                output.add_output(f"  {block:32} {ascii_block}")
+        except Exception as e:
+            output.add_output(f"Failed to read value: {e}", "red")
 
     def _find(self, args: list[str]) -> None:
-        if not self._need_hive(): return
+        output = self.query_one("#output", OutputArea)
+        if not self.st.hive_open:
+            output.add_output("No hive is open. Use 'open <hive_file>' first.", "red")
+            return
         if not args:
-            console.print("[dim]Usage:[/dim] find [bold]<pattern>[/bold]")
+            output.add_output("Usage: find <pattern>", "red")
             return
-        pattern = " ".join(args)
-        console.print(f"[dim]searching keys…[/dim]")
-        results = bridge.find(self.st.hive_path, self.st.path, pattern)
-        if not results:
-            console.print("[dim]no results.[/dim]")
-            return
-        t = Table(box=box.SIMPLE_HEAVY, header_style="bold dim", padding=(0,1))
-        t.add_column("Path", style="blue")
-        t.add_column("Last write", style="dim")
-        t.add_column("Subs", justify="right", style="dim")
-        for k in results:
-            t.add_row(k.get("path","?"), _ts(k.get("timestamp")),
-                      str(k.get("num_subkeys",0)))
-        console.print(t)
-        console.print(f"[dim]{len(results)} result(s)[/dim]")
+        pattern = args[0]
+        try:
+            results = bridge.find(self.st.hive_path, pattern)
+            if not results:
+                output.add_output(f"No matches for: {pattern}")
+                return
+            output.add_output(f"Matches for: {pattern}")
+            for r in results[:20]:  # limit output
+                path = r.get('path', '')
+                typ = r.get('type', 'unknown')
+                output.add_output(f"  {path} ({typ})", "cyan")
+            if len(results) > 20:
+                output.add_output(f"... and {len(results)-20} more")
+        except Exception as e:
+            output.add_output(f"Failed to search: {e}", "red")
 
     def _search(self, args: list[str]) -> None:
-        if not self._need_hive(): return
+        output = self.query_one("#output", OutputArea)
+        if not self.st.hive_open:
+            output.add_output("No hive is open. Use 'open <hive_file>' first.", "red")
+            return
         if not args:
-            console.print("[dim]Usage:[/dim] search [bold]<text>[/bold]")
+            output.add_output("Usage: search <text>", "red")
             return
-        pattern = " ".join(args)
-        console.print(f"[dim]searching values…[/dim]")
-        results = bridge.search(self.st.hive_path, self.st.path, pattern)
-        if not results:
-            console.print("[dim]no results.[/dim]")
-            return
-        t = Table(box=box.SIMPLE_HEAVY, header_style="bold dim", padding=(0,1))
-        t.add_column("Key", style="blue")
-        t.add_column("Value")
-        t.add_column("Type", style="dim")
-        t.add_column("Data", overflow="fold")
-        for item in results:
-            k = item.get("key",{})
-            v = item.get("value",{})
-            t.add_row(k.get("path","?"), v.get("name","") or "(Default)",
-                      v.get("type",""), str(v.get("value",""))[:100])
-        console.print(t)
+        text = args[0]
+        try:
+            results = bridge.search(self.st.hive_path, text)
+            if not results:
+                output.add_output(f"No matches for: {text}")
+                return
+            output.add_output(f"Matches for: {text}")
+            for r in results[:20]:
+                path = r.get('path', '')
+                value = r.get('value', '')
+                output.add_output(f"  {path} {value}", "cyan")
+                output.add_output(f"  {value}", "green")
+            if len(results) > 20:
+                output.add_output(f"... and {len(results)-20} more")
+        except Exception as e:
+            output.add_output(f"Failed to search: {e}", "red")
 
     def _note(self, args: list[str]) -> None:
-        if not self._need_hive(): return
-        data  = bridge.ls(self.st.hive_path, self.st.path)
-        key   = data.get("key", {})
-        vals  = data.get("values", [])
-        subs  = data.get("subkeys", [])
-        now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # ── Metadata block ────────────────────────────────────────────────────
-        ts_iso  = _ts_plain(key.get("timestamp"))
-        ts_unix = key.get("timestamp_unix", "")
-        lines = [
-            f"\n---\n",
-            f"## `{self.st.path}`",
-            f"",
-            f"| Campo | Valor |",
-            f"|-------|-------|",
-            f"| Hive | `{self.st.hive_name}` |",
-            f"| Capturado (local) | `{now}` |",
-            f"| **Última escrita (UTC)** | **`{ts_iso}`** |",
-        ]
-        if ts_unix:
-            lines.append(f"| Última escrita (Unix) | `{ts_unix}` |")
-        lines += [
-            f"| Cell offset | `0x{key.get('cell_offset', 0):08x}` |",
-            f"| Subchaves | {key.get('num_subkeys', 0)} |",
-            f"| Valores | {key.get('num_values', 0)} |",
-            f"",
-        ]
-
-        # ── Values table ──────────────────────────────────────────────────────
-        if vals:
-            lines += [
-                "### Valores",
-                "",
-                "| Valor | Tipo | Tamanho | Dado |",
-                "|-------|------|---------|------|",
-            ]
-            for v in vals:
-                name = (v.get("name", "") or "(Default)").replace("|", "\\|")
-                val  = str(v.get("value", "")).replace("|", "\\|")
-                if len(val) > 120:
-                    val = val[:117] + "…"
-                lines.append(
-                    f"| `{name}` | {v.get('type','')} "
-                    f"| {v.get('size', 0):,} B | {val} |"
-                )
-            lines.append("")
-
-        # ── Subkeys with timestamps ───────────────────────────────────────────
-        if subs:
-            lines += [
-                "### Subchaves",
-                "",
-                "| Subchave | Última escrita (UTC) | Unix | Subs | Vals |",
-                "|----------|----------------------|------|------|------|",
-            ]
-            for sk in subs:
-                sk_ts    = _ts_plain(sk.get("timestamp"))
-                sk_unix  = sk.get("timestamp_unix", "")
-                lines.append(
-                    f"| `{sk.get('name','')}` "
-                    f"| `{sk_ts}` "
-                    f"| `{sk_unix}` "
-                    f"| {sk.get('num_subkeys',0)} "
-                    f"| {sk.get('num_values',0)} |"
-                )
-            lines.append("")
-
-        lines.append("")
-
-        entry = "\n".join(lines)
-
-        # Append to data.md
-        md_path = Path(self.st.config.get("note_file", "data.md"))
-        if not md_path.exists():
-            md_path.write_text("# RegBroker Notes\n\n", encoding="utf-8")
-        with open(md_path, "a", encoding="utf-8") as f:
-            f.write(entry)
-
-        console.print(f"[green]✓[/green] Appended to [bold]{md_path}[/bold]")
-        console.print(f"[dim]Opening editor…[/dim]")
-
-        self._editor.run(md_path)
+        output = self.query_one("#output", OutputArea)
+        note_text = " ".join(args) if args else None
+        try:
+            self._editor.edit(note_text)
+            output.add_output("Note editor opened")
+        except Exception as e:
+            output.add_output(f"Failed to open editor: {e}", "red")
 
     def _report(self, args: list[str]) -> None:
-        if not self._need_hive(): return
-
-        sub = args[0].lower() if args else ""
-
-        if sub == "edit":
-            if not self.st.report_path.exists():
-                console.print("[dim]No report yet. Run [bold]report[/bold] first.[/dim]")
-                return
-            self._editor.run(self.st.report_path)
+        output = self.query_one("#output", OutputArea)
+        if not self.st.hive_open:
+            output.add_output("No hive is open. Use 'open <hive_file>' first.", "red")
             return
-
-        if sub == "save":
-            if not self.st.report_path.exists():
-                console.print("[dim]No report yet. Run [bold]report[/bold] first.[/dim]")
-                return
-            pdf_path = str(self.st.report_path.with_suffix(".pdf"))
-            if len(args) > 1:
-                pdf_path = args[1]
-            console.print(f"[dim]Generating PDF…[/dim]")
-            from .ai.report import save_pdf
-            md_text = self.st.report_path.read_text(encoding="utf-8")
-            out = save_pdf(md_text, pdf_path)
-            console.print(f"[green]✓[/green] PDF saved: [bold]{out}[/bold]")
+        if not self.st.ai:
+            output.add_output("AI client not configured. Use 'config' first.", "red")
             return
-
-        # Generate new report
-        if not self._need_ai(): return
-
-        console.print()
-        console.rule("[bold cyan]Gerando laudo pericial[/bold cyan]", style="cyan")
-        console.print(f"[dim]Modelo: {self.st.ai.model}[/dim]")
-        console.print()
-
-        # Collect context
-        ls_data  = bridge.ls(self.st.hive_path, self.st.path)
-        recovery = None
         try:
-            console.print("[dim]Escaneando artefatos deletados…[/dim]")
-            recovery = bridge.recover(self.st.hive_path)
+            from .ai.report import generate_report
+            self.st.report_md = generate_report(self.st)
+            output.add_output("Report generated successfully!", "green")
+            output.add_output(f"Saved to: {self.st.report_path}")
+        except Exception as e:
+            output.add_output(f"Failed to generate report: {e}", "red")
         except Exception:
             pass
 

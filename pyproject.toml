@@ -13,6 +13,7 @@ dependencies = [
     "rich>=13.0",
     "fpdf2>=2.7",
     "pyperclip>=1.8",
+    "regipy",
 ]
 
 [project.scripts]

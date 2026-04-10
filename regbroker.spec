@@ -14,7 +14,7 @@ a = Analysis(
     pathex=['.'],
     datas=[],
     hiddenimports=[
-        'src', 'src.ai', 'src.tui', 'src.bridge',
+        'src', 'src.ai', 'src.tui', 'src', 'regipy',
         'rich', 'prompt_toolkit', 'httpx', 'fpdf2', 'pyperclip',
         'setuptools', 'packaging', 'importlib_metadata'
     ],

@@ -18,8 +18,8 @@ if __name__ == "__main__":
 # Import modules
 try:
     import config as cfg_mod
-    import minimal_repl
-    run_repl = minimal_repl.run_minimal_repl
+    import repl
+    run_repl = repl.run_repl
 except ImportError as e:
     print(f"Import error: {e}")
     print("Could not import required modules.")
